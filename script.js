@@ -63,6 +63,8 @@ cropBtn.addEventListener('click', () => {
   // Crop button only works when an overlay image is loaded
   if (!overlayImg) return;
   if (!cropMode) {
+    // Save current state before entering crop mode for undo
+    saveState();
     // Enter crop mode: reset any previous selection
     cropMode = true;
     cropping = false;
@@ -160,6 +162,9 @@ function drawScene() {
       const rectW = dispX2 - dispX1;
       const rectH = dispY2 - dispY1;
       ctx.save();
+      // Fill cropping rectangle with semi‑transparent white to highlight the selected area
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+      ctx.fillRect(rectX, rectY, rectW, rectH);
       ctx.strokeStyle = 'rgba(255, 0, 0, 0.8)';
       ctx.lineWidth = 1;
       ctx.setLineDash([6, 4]);
@@ -284,6 +289,10 @@ overlayInput.addEventListener('change', (e) => {
       cropEnd = null;
       cropBtn.textContent = 'Crop';
       drawScene();
+      // Reset undo/redo stacks and save the initial state for undo
+      undoStack.length = 0;
+      redoStack.length = 0;
+      saveState();
     });
   };
   rawImg.src = URL.createObjectURL(file);
@@ -303,6 +312,10 @@ removeOverlayBtn.addEventListener('click', () => {
   cropEnd = null;
   cropBtn.textContent = 'Crop';
   drawScene();
+  // Clear undo/redo stacks when overlay is removed
+  undoStack.length = 0;
+  redoStack.length = 0;
+  updateUndoRedoButtons();
 });
 
 // Set output directory using File System Access API
@@ -341,11 +354,17 @@ newBtn.addEventListener('click', () => {
   cropStart = null;
   cropEnd = null;
   cropBtn.textContent = 'Crop';
+  // Clear undo/redo stacks on new session
+  undoStack.length = 0;
+  redoStack.length = 0;
+  updateUndoRedoButtons();
 });
 
 // Resize overlay
 smallerBtn.addEventListener('click', () => {
   if (!overlayImg) return;
+  // Save state before scaling for undo
+  saveState();
   const factor = 1 / 1.10;
   overlayState.scale *= factor;
   // Ensure overlay stays within bounds
@@ -359,6 +378,8 @@ smallerBtn.addEventListener('click', () => {
 });
 biggerBtn.addEventListener('click', () => {
   if (!overlayImg) return;
+  // Save state before scaling for undo
+  saveState();
   const factor = 1.10;
   // Prevent overlay from exceeding background size
   const nextScale = overlayState.scale * factor;
@@ -371,6 +392,8 @@ biggerBtn.addEventListener('click', () => {
 
 // Angle input
 angleInput.addEventListener('input', (e) => {
+  // Save state before changing angle via input
+  saveState();
   const val = parseFloat(e.target.value) || 0;
   let angle = val;
   if (angle > 180) angle -= 360;
@@ -381,16 +404,22 @@ angleInput.addEventListener('input', (e) => {
 
 // Rotation buttons
 rotM5Btn.addEventListener('click', () => {
+  // Save state before rotating for undo
+  saveState();
   overlayState.angle = normalizeAngle(overlayState.angle - 5);
   angleInput.value = Math.round(overlayState.angle);
   drawScene();
 });
 rotP5Btn.addEventListener('click', () => {
+  // Save state before rotating for undo
+  saveState();
   overlayState.angle = normalizeAngle(overlayState.angle + 5);
   angleInput.value = Math.round(overlayState.angle);
   drawScene();
 });
 rotResetBtn.addEventListener('click', () => {
+  // Save state before resetting rotation for undo
+  saveState();
   overlayState.angle = 0;
   angleInput.value = 0;
   drawScene();
@@ -398,10 +427,14 @@ rotResetBtn.addEventListener('click', () => {
 
 // Flip buttons
 flipHBtn.addEventListener('click', () => {
+  // Save state before flipping horizontally for undo
+  saveState();
   overlayState.flipH = !overlayState.flipH;
   drawScene();
 });
 flipVBtn.addEventListener('click', () => {
+  // Save state before flipping vertically for undo
+  saveState();
   overlayState.flipV = !overlayState.flipV;
   drawScene();
 });
@@ -417,6 +450,8 @@ function normalizeAngle(angle) {
 // Canvas pointer events for dragging
 canvas.addEventListener('pointerdown', (e) => {
   if (!overlayImg || !bgImg) return;
+  // Save state before any interaction (dragging/resizing/cropping) for undo
+  saveState();
   // Compute pointer coordinates relative to canvas pixel space
   const rect = canvas.getBoundingClientRect();
   const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
@@ -746,9 +781,6 @@ function performCrop() {
     newY = Math.max(0, Math.min(newY, bgImg.height - newHeightScaled));
     overlayState.x = newX;
     overlayState.y = newY;
-    // Reset flips (cropping removes flipped orientation)
-    overlayState.flipH = false;
-    overlayState.flipV = false;
     // Reset crop state
     cropStart = null;
     cropEnd = null;
