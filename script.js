@@ -57,6 +57,131 @@ let cropStart = null;
 // Ending corner of crop rectangle in unscaled overlay local coordinates
 let cropEnd = null;
 
+// Undo/Redo state and buttons. We maintain a stack of previous states
+// (undoStack) and a stack of undone states (redoStack). Each state stores
+// the overlay image data URL, the original keyed overlay data URL and the
+// overlayState parameters. This allows reverting and re‑applying edits such as
+// moves, resizes, rotations, flips and cropping.
+const undoBtn = document.getElementById('undo');
+const redoBtn = document.getElementById('redo');
+const undoStack = [];
+const redoStack = [];
+
+// Save the current overlay state onto the undo stack and clear the redo
+// stack. Only saves when an overlay exists. Called at the beginning of
+// interactive actions (dragging, resizing, rotating, flipping, cropping).
+function saveState() {
+  if (!overlayImg || !overlayOriginalImg) return;
+  const stateCopy = { ...overlayState };
+  const overlayData = overlayImg.src;
+  const originalData = overlayOriginalImg.src;
+  undoStack.push({ overlayData, originalData, state: stateCopy });
+  // Clear redo history when a new action is recorded
+  redoStack.length = 0;
+  updateUndoRedoButtons();
+}
+
+// Restore the most recent state from the undo stack. The current state is
+// pushed onto the redo stack before restoring. If no undo is available the
+// function does nothing.
+function undo() {
+  if (undoStack.length === 0) return;
+  // Push current state onto redo stack
+  if (overlayImg && overlayOriginalImg) {
+    const current = {
+      overlayData: overlayImg.src,
+      originalData: overlayOriginalImg.src,
+      state: { ...overlayState },
+    };
+    redoStack.push(current);
+  } else {
+    redoStack.push({ overlayData: null, originalData: null, state: null });
+  }
+  const prev = undoStack.pop();
+  if (prev.overlayData) {
+    const img = new Image();
+    img.onload = () => {
+      overlayImg = img;
+      overlayOriginalImg = img;
+      overlayState = { ...prev.state };
+      drawScene();
+      updateUndoRedoButtons();
+    };
+    img.src = prev.overlayData;
+  } else {
+    // If prev.overlayData is null, remove overlay
+    overlayImg = null;
+    overlayOriginalImg = null;
+    drawScene();
+    updateUndoRedoButtons();
+  }
+}
+
+// Reapply the most recently undone state from the redo stack. The current
+// state is pushed back to the undo stack before restoring. If no redo is
+// available the function does nothing.
+function redo() {
+  if (redoStack.length === 0) return;
+  // Push current state onto undo stack
+  if (overlayImg && overlayOriginalImg) {
+    const current = {
+      overlayData: overlayImg.src,
+      originalData: overlayOriginalImg.src,
+      state: { ...overlayState },
+    };
+    undoStack.push(current);
+  } else {
+    undoStack.push({ overlayData: null, originalData: null, state: null });
+  }
+  const next = redoStack.pop();
+  if (next.overlayData) {
+    const img = new Image();
+    img.onload = () => {
+      overlayImg = img;
+      overlayOriginalImg = img;
+      overlayState = { ...next.state };
+      drawScene();
+      updateUndoRedoButtons();
+    };
+    img.src = next.overlayData;
+  } else {
+    overlayImg = null;
+    overlayOriginalImg = null;
+    drawScene();
+    updateUndoRedoButtons();
+  }
+}
+
+// Enable or disable undo and redo buttons based on stack sizes.
+function updateUndoRedoButtons() {
+  undoBtn.disabled = undoStack.length === 0;
+  redoBtn.disabled = redoStack.length === 0;
+}
+
+// Attach click handlers for undo/redo buttons
+undoBtn.addEventListener('click', () => {
+  undo();
+});
+redoBtn.addEventListener('click', () => {
+  redo();
+});
+
+// Keyboard shortcuts: Ctrl/Cmd+Z for undo, Ctrl+Y or Ctrl+Shift+Z for redo
+document.addEventListener('keydown', (e) => {
+  const isCtrlOrMeta = e.ctrlKey || e.metaKey;
+  if (!isCtrlOrMeta) return;
+  // Undo: Ctrl/Cmd+Z (no Shift)
+  if (e.code === 'KeyZ' && !e.shiftKey) {
+    e.preventDefault();
+    undo();
+  }
+  // Redo: Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z
+  if ((e.code === 'KeyY') || (e.code === 'KeyZ' && e.shiftKey)) {
+    e.preventDefault();
+    redo();
+  }
+});
+
 // Crop button toggles crop mode on and off. When entering crop mode the user can drag
 // a rectangle on the overlay to crop the image. Clicking again cancels crop mode.
 cropBtn.addEventListener('click', () => {
@@ -626,6 +751,8 @@ canvas.addEventListener('pointerup', (e) => {
     resizeHandle = -1;
     canvas.releasePointerCapture(e.pointerId);
   }
+  // Update undo/redo button states after any interaction
+  updateUndoRedoButtons();
 });
 
 // Save outputs (async to allow writing files via File System Access API)
