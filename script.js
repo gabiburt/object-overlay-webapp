@@ -1,0 +1,460 @@
+// Front-end logic for the Image Overlay Web App.
+// This script implements an interactive canvas where a user can load a
+// background and an overlay image (with a grey matte), drag the overlay
+// around, resize it, rotate it, flip it horizontally or vertically and
+// export two images: the composited canvas and the keyed overlay only.
+
+/* Global state */
+let bgImg = null;              // HTMLImageElement for background
+let overlayImg = null;         // HTMLImageElement for keyed overlay
+let overlayOriginalImg = null; // Original keyed overlay (untransformed)
+let overlayState = {
+  x: 0,
+  y: 0,
+  scale: 1,
+  angle: 0,   // degrees
+  flipH: false,
+  flipV: false,
+};
+let dragging = false;
+let dragData = { localX: 0, localY: 0 };
+let saveCounter = 0;
+
+// Canvas and context
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// UI elements
+const bgInput = document.getElementById('bg-input');
+const overlayInput = document.getElementById('overlay-input');
+const removeOverlayBtn = document.getElementById('remove-overlay');
+const setOutputBtn = document.getElementById('set-output');
+const controls = document.getElementById('controls');
+const smallerBtn = document.getElementById('smaller');
+const biggerBtn = document.getElementById('bigger');
+const angleInput = document.getElementById('angle-input');
+const rotM5Btn = document.getElementById('rot-m5');
+const rotP5Btn = document.getElementById('rot-p5');
+const rotResetBtn = document.getElementById('rot-reset');
+const flipHBtn = document.getElementById('flip-h');
+const flipVBtn = document.getElementById('flip-v');
+const outputPrefixInput = document.getElementById('output-prefix');
+const saveBtn = document.getElementById('save');
+const newBtn = document.getElementById('new-session');
+const outputStatus = document.getElementById('output-status');
+
+// Handle to a user-selected output directory (via File System Access API)
+let outputDirHandle = null;
+
+// Helper: draw the current scene onto the canvas
+function drawScene() {
+  if (!bgImg) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  // Resize canvas to background image size
+  canvas.width = bgImg.width;
+  canvas.height = bgImg.height;
+  // Draw background
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bgImg, 0, 0);
+  // Draw overlay if present
+  if (overlayImg) {
+    const w = overlayImg.width * overlayState.scale;
+    const h = overlayImg.height * overlayState.scale;
+    const cx = overlayState.x + w / 2;
+    const cy = overlayState.y + h / 2;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate((overlayState.angle * Math.PI) / 180);
+    // Flip via scaling negative axes
+    const sx = overlayState.flipH ? -1 : 1;
+    const sy = overlayState.flipV ? -1 : 1;
+    ctx.scale(sx, sy);
+    ctx.scale(overlayState.scale, overlayState.scale);
+    ctx.drawImage(
+      overlayImg,
+      -overlayImg.width / 2,
+      -overlayImg.height / 2
+    );
+    ctx.restore();
+  }
+}
+
+// Helper: apply grey key to an Image to produce an RGBA image
+function applyGreyKey(img, callback) {
+  // Create a temporary canvas to read pixel data
+  const tmpCanvas = document.createElement('canvas');
+  tmpCanvas.width = img.width;
+  tmpCanvas.height = img.height;
+  const tmpCtx = tmpCanvas.getContext('2d');
+  tmpCtx.drawImage(img, 0, 0);
+  const imageData = tmpCtx.getImageData(0, 0, tmpCanvas.width, tmpCanvas.height);
+  const data = imageData.data;
+  const keyR = 128;
+  const keyG = 128;
+  const keyB = 128;
+  const tol = 22;
+  const ramp = tol < 254 ? 2 : 1;
+  // Precompute ramp lookup table for performance
+  const lut = new Uint8ClampedArray(256);
+  for (let d = 0; d < 256; d++) {
+    let a;
+    if (d <= tol) {
+      a = 0;
+    } else if (d >= tol + ramp) {
+      a = 255;
+    } else {
+      a = Math.round((255 * (d - tol)) / ramp);
+    }
+    lut[d] = a;
+  }
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const dr = Math.abs(r - keyR);
+    const dg = Math.abs(g - keyG);
+    const db = Math.abs(b - keyB);
+    const maxDiff = Math.max(dr, Math.max(dg, db));
+    data[i + 3] = lut[maxDiff];
+  }
+  tmpCtx.putImageData(imageData, 0, 0);
+  const rgbaImg = new Image();
+  rgbaImg.onload = () => callback(rgbaImg);
+  rgbaImg.src = tmpCanvas.toDataURL();
+}
+
+// Event: load background
+bgInput.addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const img = new Image();
+  img.onload = () => {
+    bgImg = img;
+    // Reset save counter
+    saveCounter = 0;
+    drawScene();
+    // If overlay exists but is larger than new background, resize overlay
+    if (overlayImg) {
+      // Fit overlay within background bounds
+      const maxW = bgImg.width;
+      const maxH = bgImg.height;
+      const ovW = overlayImg.width;
+      const ovH = overlayImg.height;
+      const scaleX = maxW / ovW;
+      const scaleY = maxH / ovH;
+      const maxScale = Math.min(scaleX, scaleY, 1);
+      overlayState.scale = maxScale;
+      // Clamp overlay position
+      overlayState.x = Math.min(overlayState.x, bgImg.width - ovW * overlayState.scale);
+      overlayState.y = Math.min(overlayState.y, bgImg.height - ovH * overlayState.scale);
+    }
+    controls.style.display = 'flex';
+    saveBtn.disabled = !overlayImg;
+    setOutputBtn.disabled = false;
+  };
+  img.src = URL.createObjectURL(file);
+});
+
+// Event: load overlay
+overlayInput.addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file || !bgImg) return;
+  const rawImg = new Image();
+  rawImg.onload = () => {
+    // Apply grey key to convert to RGBA with transparency
+    applyGreyKey(rawImg, (rgbaImg) => {
+      overlayImg = rgbaImg;
+      overlayOriginalImg = rgbaImg; // Save untransformed for overlay-only output
+      // Compute initial scale: fit overlay into background if larger
+      const maxW = bgImg.width;
+      const maxH = bgImg.height;
+      const ovW = overlayImg.width;
+      const ovH = overlayImg.height;
+      const scaleX = maxW / ovW;
+      const scaleY = maxH / ovH;
+      const maxScale = Math.min(scaleX, scaleY, 1);
+      overlayState.scale = maxScale;
+      overlayState.angle = 0;
+      overlayState.flipH = false;
+      overlayState.flipV = false;
+      // Place overlay near top-left with small margin
+      overlayState.x = Math.min(20, maxW - ovW * overlayState.scale);
+      overlayState.y = Math.min(20, maxH - ovH * overlayState.scale);
+      saveBtn.disabled = false;
+      removeOverlayBtn.disabled = false;
+      angleInput.value = 0;
+      drawScene();
+    });
+  };
+  rawImg.src = URL.createObjectURL(file);
+});
+
+// Remove overlay
+removeOverlayBtn.addEventListener('click', () => {
+  overlayImg = null;
+  overlayOriginalImg = null;
+  saveBtn.disabled = true;
+  removeOverlayBtn.disabled = true;
+  drawScene();
+});
+
+// Set output directory using File System Access API
+setOutputBtn.addEventListener('click', async () => {
+  try {
+    // Prompt user to select a directory. Requires secure context (https) in most browsers.
+    const dirHandle = await window.showDirectoryPicker();
+    outputDirHandle = dirHandle;
+    outputStatus.textContent = `Output: ${dirHandle.name || 'selected'}`;
+  } catch (err) {
+    // User cancelled or API unavailable
+    console.error('Directory selection cancelled or not supported', err);
+  }
+});
+
+// New session: clear everything
+newBtn.addEventListener('click', () => {
+  bgImg = null;
+  overlayImg = null;
+  overlayOriginalImg = null;
+  overlayState = { x: 0, y: 0, scale: 1, angle: 0, flipH: false, flipV: false };
+  dragData = { localX: 0, localY: 0 };
+  saveCounter = 0;
+  removeOverlayBtn.disabled = true;
+  saveBtn.disabled = true;
+  angleInput.value = 0;
+  controls.style.display = 'none';
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  setOutputBtn.disabled = true;
+  outputDirHandle = null;
+  outputStatus.textContent = '';
+});
+
+// Resize overlay
+smallerBtn.addEventListener('click', () => {
+  if (!overlayImg) return;
+  const factor = 1 / 1.10;
+  overlayState.scale *= factor;
+  // Ensure overlay stays within bounds
+  const w = overlayImg.width * Math.abs(overlayState.scale);
+  const h = overlayImg.height * Math.abs(overlayState.scale);
+  if (bgImg) {
+    overlayState.x = Math.min(overlayState.x, bgImg.width - w);
+    overlayState.y = Math.min(overlayState.y, bgImg.height - h);
+  }
+  drawScene();
+});
+biggerBtn.addEventListener('click', () => {
+  if (!overlayImg) return;
+  const factor = 1.10;
+  // Prevent overlay from exceeding background size
+  const nextScale = overlayState.scale * factor;
+  const w = overlayImg.width * Math.abs(nextScale);
+  const h = overlayImg.height * Math.abs(nextScale);
+  if (bgImg && (w > bgImg.width || h > bgImg.height)) return;
+  overlayState.scale = nextScale;
+  drawScene();
+});
+
+// Angle input
+angleInput.addEventListener('input', (e) => {
+  const val = parseFloat(e.target.value) || 0;
+  let angle = val;
+  if (angle > 180) angle -= 360;
+  if (angle < -180) angle += 360;
+  overlayState.angle = angle;
+  drawScene();
+});
+
+// Rotation buttons
+rotM5Btn.addEventListener('click', () => {
+  overlayState.angle = normalizeAngle(overlayState.angle - 5);
+  angleInput.value = Math.round(overlayState.angle);
+  drawScene();
+});
+rotP5Btn.addEventListener('click', () => {
+  overlayState.angle = normalizeAngle(overlayState.angle + 5);
+  angleInput.value = Math.round(overlayState.angle);
+  drawScene();
+});
+rotResetBtn.addEventListener('click', () => {
+  overlayState.angle = 0;
+  angleInput.value = 0;
+  drawScene();
+});
+
+// Flip buttons
+flipHBtn.addEventListener('click', () => {
+  overlayState.flipH = !overlayState.flipH;
+  drawScene();
+});
+flipVBtn.addEventListener('click', () => {
+  overlayState.flipV = !overlayState.flipV;
+  drawScene();
+});
+
+// Normalize angle to [-180, 180]
+function normalizeAngle(angle) {
+  let a = angle;
+  while (a > 180) a -= 360;
+  while (a < -180) a += 360;
+  return a;
+}
+
+// Canvas pointer events for dragging
+canvas.addEventListener('pointerdown', (e) => {
+  if (!overlayImg || !bgImg) return;
+  // Compute pointer coordinates relative to canvas pixel space
+  const rect = canvas.getBoundingClientRect();
+  const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
+  const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
+  // Check if inside overlay bounding box after rotation
+  const w = overlayImg.width * Math.abs(overlayState.scale);
+  const h = overlayImg.height * Math.abs(overlayState.scale);
+  const cx = overlayState.x + w / 2;
+  const cy = overlayState.y + h / 2;
+  // Translate to centre
+  const dx = x - cx;
+  const dy = y - cy;
+  const angleRad = (-overlayState.angle * Math.PI) / 180;
+  const localX = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
+  const localY = dx * Math.sin(angleRad) + dy * Math.cos(angleRad);
+  if (Math.abs(localX) <= w / 2 && Math.abs(localY) <= h / 2) {
+    dragging = true;
+    dragData.localX = localX;
+    dragData.localY = localY;
+    canvas.setPointerCapture(e.pointerId);
+  }
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!dragging || !overlayImg || !bgImg) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
+  const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
+  const w = overlayImg.width * Math.abs(overlayState.scale);
+  const h = overlayImg.height * Math.abs(overlayState.scale);
+  const angleRad = (overlayState.angle * Math.PI) / 180;
+  // Inverse transform local coords to compute new centre
+  const dx = dragData.localX;
+  const dy = dragData.localY;
+  const globalLocalX = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
+  const globalLocalY = dx * Math.sin(angleRad) + dy * Math.cos(angleRad);
+  const newCx = x - globalLocalX;
+  const newCy = y - globalLocalY;
+  let newX = newCx - w / 2;
+  let newY = newCy - h / 2;
+  // Clamp within background bounds
+  newX = Math.max(0, Math.min(newX, bgImg.width - w));
+  newY = Math.max(0, Math.min(newY, bgImg.height - h));
+  overlayState.x = newX;
+  overlayState.y = newY;
+  drawScene();
+});
+
+canvas.addEventListener('pointerup', (e) => {
+  if (dragging) {
+    dragging = false;
+    canvas.releasePointerCapture(e.pointerId);
+  }
+});
+
+// Save outputs (async to allow writing files via File System Access API)
+saveBtn.addEventListener('click', async () => {
+  if (!bgImg || !overlayImg) return;
+  // Determine base name for output
+  let prefix = outputPrefixInput.value.trim();
+  if (!prefix) {
+    // default: use background file name if available
+    const bgFile = bgInput.files[0];
+    if (bgFile) {
+      const name = bgFile.name;
+      prefix = name.replace(/\.[^.]+$/, '');
+    } else {
+      prefix = 'output';
+    }
+  }
+  // Compose composite canvas
+  const canvasComposite = document.createElement('canvas');
+  canvasComposite.width = bgImg.width;
+  canvasComposite.height = bgImg.height;
+  const ctxC = canvasComposite.getContext('2d');
+  ctxC.drawImage(bgImg, 0, 0);
+  const w = overlayImg.width * overlayState.scale;
+  const h = overlayImg.height * overlayState.scale;
+  const cx = overlayState.x + w / 2;
+  const cy = overlayState.y + h / 2;
+  ctxC.save();
+  ctxC.translate(cx, cy);
+  ctxC.rotate((overlayState.angle * Math.PI) / 180);
+  const sx = overlayState.flipH ? -1 : 1;
+  const sy = overlayState.flipV ? -1 : 1;
+  ctxC.scale(sx, sy);
+  ctxC.scale(overlayState.scale, overlayState.scale);
+  ctxC.drawImage(
+    overlayImg,
+    -overlayImg.width / 2,
+    -overlayImg.height / 2
+  );
+  ctxC.restore();
+  const compositeDataUrl = canvasComposite.toDataURL('image/png');
+  // Create overlay-only canvas (original keyed)
+  const canvasObj = document.createElement('canvas');
+  canvasObj.width = overlayOriginalImg.width;
+  canvasObj.height = overlayOriginalImg.height;
+  const ctxO = canvasObj.getContext('2d');
+  ctxO.drawImage(overlayOriginalImg, 0, 0);
+  const objectDataUrl = canvasObj.toDataURL('image/png');
+  // Determine unique base name
+  const baseName = saveCounter === 0 ? prefix : `${prefix}_${saveCounter}`;
+  saveCounter++;
+  const canvasName = `${baseName}.png`;
+  const objectName = `${baseName}.png`;
+  // If outputDirHandle is selected, write to disk using File System Access API
+  if (outputDirHandle) {
+    try {
+      // Create subdirectories if not existing
+      const canvasDir = await outputDirHandle.getDirectoryHandle('Canvas', { create: true });
+      const objectsDir = await outputDirHandle.getDirectoryHandle('objects', { create: true });
+      // Write composite
+      await writeDataUrlToFile(canvasDir, canvasName, compositeDataUrl);
+      await writeDataUrlToFile(objectsDir, objectName, objectDataUrl);
+      alert(`Saved to ${canvasDir.name}/${canvasName} and ${objectsDir.name}/${objectName}`);
+    } catch (err) {
+      console.error('Error writing files via File System Access API:', err);
+      // Fallback to download
+      downloadDataUrl(compositeDataUrl, `Canvas_${canvasName}`);
+      downloadDataUrl(objectDataUrl, `objects_${objectName}`);
+    }
+  } else {
+    // Download via anchor; embed folder names in file name to differentiate
+    downloadDataUrl(compositeDataUrl, `Canvas_${canvasName}`);
+    downloadDataUrl(objectDataUrl, `objects_${objectName}`);
+  }
+});
+
+// Helper: write Data URL to a file in a directory using File System Access API
+async function writeDataUrlToFile(dirHandle, filename, dataUrl) {
+  const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
+  const writable = await fileHandle.createWritable();
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+  await writable.write(blob);
+  await writable.close();
+}
+
+function downloadDataUrl(dataUrl, filename) {
+  // Create a blob from data URL
+  const link = document.createElement('a');
+  link.href = dataUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+// Disable context menu on canvas to prevent default right-click behaviour
+canvas.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+});
