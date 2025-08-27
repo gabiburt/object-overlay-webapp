@@ -1,4 +1,4 @@
-// Front-end logic for the Image Overlay Web App.
+// Front‑end logic for the Image Overlay Web App.
 // This script implements an interactive canvas where a user can load a
 // background and an overlay image (with a grey matte), drag the overlay
 // around, resize it, rotate it, flip it horizontally or vertically and
@@ -18,6 +18,10 @@ let overlayState = {
 };
 let dragging = false;
 let dragData = { localX: 0, localY: 0 };
+// When true, the user is resizing the overlay via a corner handle
+let resizing = false;
+// Index of the handle being dragged (0: top‑left, 1: top‑right, 2: bottom‑right, 3: bottom‑left)
+let resizeHandle = -1;
 let saveCounter = 0;
 
 // Canvas and context
@@ -43,7 +47,7 @@ const saveBtn = document.getElementById('save');
 const newBtn = document.getElementById('new-session');
 const outputStatus = document.getElementById('output-status');
 
-// Handle to a user-selected output directory (via File System Access API)
+// Handle to a user‑selected output directory (via File System Access API)
 let outputDirHandle = null;
 
 // Helper: draw the current scene onto the canvas
@@ -77,6 +81,35 @@ function drawScene() {
       -overlayImg.width / 2,
       -overlayImg.height / 2
     );
+    ctx.restore();
+
+    // Draw bounding box and resize handles for interactive resizing
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate((overlayState.angle * Math.PI) / 180);
+    // Outline
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(-w / 2, -h / 2, w, h);
+    // Draw handles as small squares (constant size in screen pixels). We don't scale these with overlay scale.
+    const handleSize = 8;
+    const halfHandle = handleSize / 2;
+    const corners = [
+      { x: -w / 2, y: -h / 2 },
+      { x: w / 2, y: -h / 2 },
+      { x: w / 2, y: h / 2 },
+      { x: -w / 2, y: h / 2 }
+    ];
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.lineWidth = 1;
+    for (const c of corners) {
+      // Draw handle rectangle
+      ctx.beginPath();
+      ctx.rect(c.x - halfHandle, c.y - halfHandle, handleSize, handleSize);
+      ctx.fill();
+      ctx.stroke();
+    }
     ctx.restore();
   }
 }
@@ -320,6 +353,31 @@ canvas.addEventListener('pointerdown', (e) => {
   const angleRad = (-overlayState.angle * Math.PI) / 180;
   const localX = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
   const localY = dx * Math.sin(angleRad) + dy * Math.cos(angleRad);
+  // If the overlay is present, test if a corner handle is being clicked for resizing
+  if (overlayImg) {
+    // Size of the resize handle in overlay local coordinates (approx pixels)
+    const handleSize = 10; // constant size in canvas pixels
+    // Coordinates of the four corners in local space
+    const corners = [
+      { x: -w / 2, y: -h / 2 }, // top‑left
+      { x: w / 2, y: -h / 2 },  // top‑right
+      { x: w / 2, y: h / 2 },   // bottom‑right
+      { x: -w / 2, y: h / 2 }   // bottom‑left
+    ];
+    for (let i = 0; i < 4; i++) {
+      const c = corners[i];
+      if (Math.abs(localX - c.x) <= handleSize && Math.abs(localY - c.y) <= handleSize) {
+        // Start resizing from this handle
+        resizing = true;
+        resizeHandle = i;
+        dragging = false;
+        canvas.setPointerCapture(e.pointerId);
+        // Prevent default dragging selection
+        e.preventDefault();
+        return;
+      }
+    }
+  }
   if (Math.abs(localX) <= w / 2 && Math.abs(localY) <= h / 2) {
     dragging = true;
     dragData.localX = localX;
@@ -329,33 +387,79 @@ canvas.addEventListener('pointerdown', (e) => {
 });
 
 canvas.addEventListener('pointermove', (e) => {
-  if (!dragging || !overlayImg || !bgImg) return;
+  if (!overlayImg || !bgImg) return;
   const rect = canvas.getBoundingClientRect();
   const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
   const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
   const w = overlayImg.width * Math.abs(overlayState.scale);
   const h = overlayImg.height * Math.abs(overlayState.scale);
+  const cx = overlayState.x + w / 2;
+  const cy = overlayState.y + h / 2;
   const angleRad = (overlayState.angle * Math.PI) / 180;
-  // Inverse transform local coords to compute new centre
-  const dx = dragData.localX;
-  const dy = dragData.localY;
-  const globalLocalX = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
-  const globalLocalY = dx * Math.sin(angleRad) + dy * Math.cos(angleRad);
-  const newCx = x - globalLocalX;
-  const newCy = y - globalLocalY;
-  let newX = newCx - w / 2;
-  let newY = newCy - h / 2;
-  // Clamp within background bounds
-  newX = Math.max(0, Math.min(newX, bgImg.width - w));
-  newY = Math.max(0, Math.min(newY, bgImg.height - h));
-  overlayState.x = newX;
-  overlayState.y = newY;
-  drawScene();
+  // If resizing, adjust scale based on handle movement
+  if (resizing) {
+    // Transform pointer into overlay local space (accounting for rotation)
+    const dxPointer = x - cx;
+    const dyPointer = y - cy;
+    const localX = dxPointer * Math.cos(-angleRad) - dyPointer * Math.sin(-angleRad);
+    const localY = dxPointer * Math.sin(-angleRad) + dyPointer * Math.cos(-angleRad);
+    // Determine new half‑width and half‑height based on pointer
+    // We use absolute values since scale applies symmetrically about centre
+    const halfW = Math.abs(localX);
+    const halfH = Math.abs(localY);
+    // Compute provisional scale factors along each axis
+    const scaleX = (2 * halfW) / overlayImg.width;
+    const scaleY = (2 * halfH) / overlayImg.height;
+    // Maintain aspect ratio by choosing the smaller scale (so the overlay fits within the dragged rectangle)
+    let newScale = Math.min(scaleX, scaleY);
+    // Clamp newScale to a reasonable range
+    const maxScale = Math.min(bgImg.width / overlayImg.width, bgImg.height / overlayImg.height);
+    newScale = Math.min(newScale, maxScale);
+    const minScale = 0.05;
+    if (newScale < minScale) newScale = minScale;
+    // Update overlay scale
+    overlayState.scale = newScale;
+    // Recalculate new width and height
+    const newW = overlayImg.width * newScale;
+    const newH = overlayImg.height * newScale;
+    // Keep centre fixed during resize
+    overlayState.x = cx - newW / 2;
+    overlayState.y = cy - newH / 2;
+    // Clamp x,y to keep overlay inside background
+    overlayState.x = Math.max(0, Math.min(overlayState.x, bgImg.width - newW));
+    overlayState.y = Math.max(0, Math.min(overlayState.y, bgImg.height - newH));
+    drawScene();
+    return;
+  }
+  // Handle dragging overlay
+  if (dragging) {
+    // Inverse transform local coords to compute new centre
+    const dx = dragData.localX;
+    const dy = dragData.localY;
+    const globalLocalX = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
+    const globalLocalY = dx * Math.sin(angleRad) + dy * Math.cos(angleRad);
+    const newCx = x - globalLocalX;
+    const newCy = y - globalLocalY;
+    let newX = newCx - w / 2;
+    let newY = newCy - h / 2;
+    // Clamp within background bounds
+    newX = Math.max(0, Math.min(newX, bgImg.width - w));
+    newY = Math.max(0, Math.min(newY, bgImg.height - h));
+    overlayState.x = newX;
+    overlayState.y = newY;
+    drawScene();
+    return;
+  }
 });
 
 canvas.addEventListener('pointerup', (e) => {
   if (dragging) {
     dragging = false;
+    canvas.releasePointerCapture(e.pointerId);
+  }
+  if (resizing) {
+    resizing = false;
+    resizeHandle = -1;
     canvas.releasePointerCapture(e.pointerId);
   }
 });
@@ -454,7 +558,7 @@ function downloadDataUrl(dataUrl, filename) {
   document.body.removeChild(link);
 }
 
-// Disable context menu on canvas to prevent default right-click behaviour
+// Disable context menu on canvas to prevent default right‑click behaviour
 canvas.addEventListener('contextmenu', (e) => {
   e.preventDefault();
 });
