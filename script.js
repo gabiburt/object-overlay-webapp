@@ -46,6 +46,39 @@ const outputPrefixInput = document.getElementById('output-prefix');
 const saveBtn = document.getElementById('save');
 const newBtn = document.getElementById('new-session');
 const outputStatus = document.getElementById('output-status');
+// Crop button and cropping state variables
+const cropBtn = document.getElementById('crop');
+// Indicates whether user has toggled crop mode
+let cropMode = false;
+// True while pointer drag defines the crop rectangle
+let cropping = false;
+// Starting corner of crop rectangle in unscaled overlay local coordinates
+let cropStart = null;
+// Ending corner of crop rectangle in unscaled overlay local coordinates
+let cropEnd = null;
+
+// Crop button toggles crop mode on and off. When entering crop mode the user can drag
+// a rectangle on the overlay to crop the image. Clicking again cancels crop mode.
+cropBtn.addEventListener('click', () => {
+  // Crop button only works when an overlay image is loaded
+  if (!overlayImg) return;
+  if (!cropMode) {
+    // Enter crop mode: reset any previous selection
+    cropMode = true;
+    cropping = false;
+    cropStart = null;
+    cropEnd = null;
+    cropBtn.textContent = 'Cancel Crop';
+  } else {
+    // Exit crop mode without applying crop
+    cropMode = false;
+    cropping = false;
+    cropStart = null;
+    cropEnd = null;
+    cropBtn.textContent = 'Crop';
+    drawScene();
+  }
+});
 
 // Handle to a user‑selected output directory (via File System Access API)
 let outputDirHandle = null;
@@ -109,6 +142,30 @@ function drawScene() {
       ctx.rect(c.x - halfHandle, c.y - halfHandle, handleSize, handleSize);
       ctx.fill();
       ctx.stroke();
+    }
+    // If cropping is active or in progress, draw the selection rectangle
+    if ((cropMode || cropping) && cropStart && cropEnd) {
+      // Determine rectangle in local unscaled coordinates
+      let sx = Math.min(cropStart.x, cropEnd.x);
+      let ex = Math.max(cropStart.x, cropEnd.x);
+      let sy = Math.min(cropStart.y, cropEnd.y);
+      let ey = Math.max(cropStart.y, cropEnd.y);
+      // Apply flips for display
+      const dispX1 = (overlayState.flipH ? -ex : sx) * overlayState.scale;
+      const dispX2 = (overlayState.flipH ? -sx : ex) * overlayState.scale;
+      const dispY1 = (overlayState.flipV ? -ey : sy) * overlayState.scale;
+      const dispY2 = (overlayState.flipV ? -sy : ey) * overlayState.scale;
+      const rectX = dispX1;
+      const rectY = dispY1;
+      const rectW = dispX2 - dispX1;
+      const rectH = dispY2 - dispY1;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 0, 0, 0.8)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(rectX, rectY, rectW, rectH);
+      ctx.setLineDash([]);
+      ctx.restore();
     }
     ctx.restore();
   }
@@ -218,6 +275,14 @@ overlayInput.addEventListener('change', (e) => {
       saveBtn.disabled = false;
       removeOverlayBtn.disabled = false;
       angleInput.value = 0;
+      // Enable crop functionality now that an overlay is loaded
+      cropBtn.disabled = false;
+      // Reset cropping state and button label
+      cropMode = false;
+      cropping = false;
+      cropStart = null;
+      cropEnd = null;
+      cropBtn.textContent = 'Crop';
       drawScene();
     });
   };
@@ -230,6 +295,13 @@ removeOverlayBtn.addEventListener('click', () => {
   overlayOriginalImg = null;
   saveBtn.disabled = true;
   removeOverlayBtn.disabled = true;
+  // Disable crop functionality when overlay is removed
+  cropBtn.disabled = true;
+  cropMode = false;
+  cropping = false;
+  cropStart = null;
+  cropEnd = null;
+  cropBtn.textContent = 'Crop';
   drawScene();
 });
 
@@ -262,6 +334,13 @@ newBtn.addEventListener('click', () => {
   setOutputBtn.disabled = true;
   outputDirHandle = null;
   outputStatus.textContent = '';
+  // Reset crop state and disable crop button
+  cropBtn.disabled = true;
+  cropMode = false;
+  cropping = false;
+  cropStart = null;
+  cropEnd = null;
+  cropBtn.textContent = 'Crop';
 });
 
 // Resize overlay
@@ -342,22 +421,46 @@ canvas.addEventListener('pointerdown', (e) => {
   const rect = canvas.getBoundingClientRect();
   const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
   const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
-  // Check if inside overlay bounding box after rotation
+  // Compute overlay dimensions in scaled units
   const w = overlayImg.width * Math.abs(overlayState.scale);
   const h = overlayImg.height * Math.abs(overlayState.scale);
   const cx = overlayState.x + w / 2;
   const cy = overlayState.y + h / 2;
-  // Translate to centre
+  // Translate to centre and rotate into overlay local space (scaled coordinates)
   const dx = x - cx;
   const dy = y - cy;
   const angleRad = (-overlayState.angle * Math.PI) / 180;
   const localX = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
   const localY = dx * Math.sin(angleRad) + dy * Math.cos(angleRad);
-  // If the overlay is present, test if a corner handle is being clicked for resizing
+  // If crop mode is active, begin cropping when clicking inside overlay
+  if (cropMode) {
+    // Convert to unscaled local coordinates
+    const unscaledX = localX / overlayState.scale;
+    const unscaledY = localY / overlayState.scale;
+    // Check if inside overlay bounds in unscaled coordinates
+    if (Math.abs(unscaledX) <= overlayOriginalImg.width / 2 && Math.abs(unscaledY) <= overlayOriginalImg.height / 2) {
+      cropping = true;
+      cropStart = { x: unscaledX, y: unscaledY };
+      cropEnd = { x: unscaledX, y: unscaledY };
+      canvas.setPointerCapture(e.pointerId);
+      // Draw initial crop rectangle
+      drawScene();
+      e.preventDefault();
+      return;
+    } else {
+      // Clicked outside overlay: cancel crop mode
+      cropMode = false;
+      cropping = false;
+      cropStart = null;
+      cropEnd = null;
+      cropBtn.textContent = 'Crop';
+      drawScene();
+      return;
+    }
+  }
+  // Normal interactions: check resize handles first
   if (overlayImg) {
-    // Size of the resize handle in overlay local coordinates (approx pixels)
     const handleSize = 10; // constant size in canvas pixels
-    // Coordinates of the four corners in local space
     const corners = [
       { x: -w / 2, y: -h / 2 }, // top‑left
       { x: w / 2, y: -h / 2 },  // top‑right
@@ -367,17 +470,16 @@ canvas.addEventListener('pointerdown', (e) => {
     for (let i = 0; i < 4; i++) {
       const c = corners[i];
       if (Math.abs(localX - c.x) <= handleSize && Math.abs(localY - c.y) <= handleSize) {
-        // Start resizing from this handle
         resizing = true;
         resizeHandle = i;
         dragging = false;
         canvas.setPointerCapture(e.pointerId);
-        // Prevent default dragging selection
         e.preventDefault();
         return;
       }
     }
   }
+  // If within overlay bounds, start dragging
   if (Math.abs(localX) <= w / 2 && Math.abs(localY) <= h / 2) {
     dragging = true;
     dragData.localX = localX;
@@ -396,6 +498,24 @@ canvas.addEventListener('pointermove', (e) => {
   const cx = overlayState.x + w / 2;
   const cy = overlayState.y + h / 2;
   const angleRad = (overlayState.angle * Math.PI) / 180;
+  // If cropping, update the end point and redraw
+  if (cropping) {
+    const rectMov = canvas.getBoundingClientRect();
+    const px = ((e.clientX - rectMov.left) / rectMov.width) * canvas.width;
+    const py = ((e.clientY - rectMov.top) / rectMov.height) * canvas.height;
+    // Compute local coordinates relative to overlay centre, rotated into overlay local space
+    const dxp = px - cx;
+    const dyp = py - cy;
+    const angleR = (-overlayState.angle * Math.PI) / 180;
+    const localXS = dxp * Math.cos(angleR) - dyp * Math.sin(angleR);
+    const localYS = dxp * Math.sin(angleR) + dyp * Math.cos(angleR);
+    // Convert to unscaled local coordinates
+    const unscaledX = localXS / overlayState.scale;
+    const unscaledY = localYS / overlayState.scale;
+    cropEnd = { x: unscaledX, y: unscaledY };
+    drawScene();
+    return;
+  }
   // If resizing, adjust scale based on handle movement
   if (resizing) {
     // Transform pointer into overlay local space (accounting for rotation)
@@ -453,6 +573,15 @@ canvas.addEventListener('pointermove', (e) => {
 });
 
 canvas.addEventListener('pointerup', (e) => {
+  // If cropping, finalize the crop
+  if (cropping) {
+    cropping = false;
+    cropMode = false;
+    cropBtn.textContent = 'Crop';
+    canvas.releasePointerCapture(e.pointerId);
+    performCrop();
+    return;
+  }
   if (dragging) {
     dragging = false;
     canvas.releasePointerCapture(e.pointerId);
@@ -546,6 +675,86 @@ async function writeDataUrlToFile(dirHandle, filename, dataUrl) {
   const blob = await response.blob();
   await writable.write(blob);
   await writable.close();
+}
+
+// Perform cropping operation on the overlay image using cropStart and cropEnd.
+// Cropping is defined in the overlay's local coordinate system (origin at centre, units in original pixels).
+function performCrop() {
+  // Validate state
+  if (!cropStart || !cropEnd || !overlayOriginalImg) return;
+  const oldWidth = overlayOriginalImg.width;
+  const oldHeight = overlayOriginalImg.height;
+  // Determine the rectangle boundaries in local unscaled coordinates
+  let x1 = Math.min(cropStart.x, cropEnd.x);
+  let x2 = Math.max(cropStart.x, cropEnd.x);
+  let y1 = Math.min(cropStart.y, cropEnd.y);
+  let y2 = Math.max(cropStart.y, cropEnd.y);
+  // Adjust bounds for flips: unflip the selection back to original orientation
+  const x1f = overlayState.flipH ? -x2 : x1;
+  const x2f = overlayState.flipH ? -x1 : x2;
+  const y1f = overlayState.flipV ? -y2 : y1;
+  const y2f = overlayState.flipV ? -y1 : y2;
+  // Convert to pixel coordinates in the original overlay image
+  let u1 = Math.max(0, Math.floor(x1f + oldWidth / 2));
+  let u2 = Math.min(oldWidth, Math.ceil(x2f + oldWidth / 2));
+  let v1 = Math.max(0, Math.floor(y1f + oldHeight / 2));
+  let v2 = Math.min(oldHeight, Math.ceil(y2f + oldHeight / 2));
+  const wCrop = u2 - u1;
+  const hCrop = v2 - v1;
+  if (wCrop <= 0 || hCrop <= 0) {
+    // Nothing to crop
+    cropStart = null;
+    cropEnd = null;
+    return;
+  }
+  // Centre of the crop in unscaled local coordinates
+  const cropCenterX = (x1f + x2f) / 2;
+  const cropCenterY = (y1f + y2f) / 2;
+  // Create off‑screen canvas to extract cropped region
+  const tmpCanvas = document.createElement('canvas');
+  tmpCanvas.width = wCrop;
+  tmpCanvas.height = hCrop;
+  const tmpCtx = tmpCanvas.getContext('2d');
+  tmpCtx.drawImage(overlayOriginalImg, -u1, -v1);
+  const dataURL = tmpCanvas.toDataURL();
+  const newImg = new Image();
+  newImg.onload = () => {
+    // Update overlay images
+    overlayImg = newImg;
+    overlayOriginalImg = newImg;
+    // Compute global shift: how far the crop centre is from the overlay centre
+    const scale = overlayState.scale;
+    const angleRad = (overlayState.angle * Math.PI) / 180;
+    const deltaX = cropCenterX * scale;
+    const deltaY = cropCenterY * scale;
+    const shiftX = deltaX * Math.cos(angleRad) - deltaY * Math.sin(angleRad);
+    const shiftY = deltaX * Math.sin(angleRad) + deltaY * Math.cos(angleRad);
+    // Compute old global centre
+    const oldCentreX = overlayState.x + (oldWidth * scale) / 2;
+    const oldCentreY = overlayState.y + (oldHeight * scale) / 2;
+    // Compute new overlay dimensions (scaled)
+    const newWidthScaled = wCrop * scale;
+    const newHeightScaled = hCrop * scale;
+    // New centre after cropping
+    let newCentreX = oldCentreX + shiftX;
+    let newCentreY = oldCentreY + shiftY;
+    // Compute new top‑left position
+    let newX = newCentreX - newWidthScaled / 2;
+    let newY = newCentreY - newHeightScaled / 2;
+    // Clamp within background bounds
+    newX = Math.max(0, Math.min(newX, bgImg.width - newWidthScaled));
+    newY = Math.max(0, Math.min(newY, bgImg.height - newHeightScaled));
+    overlayState.x = newX;
+    overlayState.y = newY;
+    // Reset flips (cropping removes flipped orientation)
+    overlayState.flipH = false;
+    overlayState.flipV = false;
+    // Reset crop state
+    cropStart = null;
+    cropEnd = null;
+    drawScene();
+  };
+  newImg.src = dataURL;
 }
 
 function downloadDataUrl(dataUrl, filename) {
